@@ -1,0 +1,103 @@
+name: Decode Scripts
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:   # 手动触发时全量解密一次（首次初始化/强制刷新用）
+
+# 同一分支串行执行，避免两次运行同时 force push 重写历史互相覆盖
+concurrency:
+  group: decode-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  decode:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # 需要完整历史，才能对比本次 push 到底改了哪些文件
+          fetch-depth: 0
+
+      # ── 1. 判断本次提交改动了哪些语言，没改动的语言后面直接跳过 ──────────
+      - name: Detect changed file types
+        id: changed
+        run: |
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            # 手动触发 / 首次推送 / 历史已被重写时：按“全部文件都变更”处理
+            CHANGED="$(git ls-tree -r --name-only "$AFTER")"
+          else
+            # --diff-filter=d：排除被删除的文件（删掉的文件没有内容可解密）
+            CHANGED="$(git diff --name-only --diff-filter=d "$BEFORE" "$AFTER")"
+          fi
+
+          echo "本次变更的文件："
+          echo "$CHANGED"
+
+          js=false
+          py=false
+          if grep -q '\.js$' <<<"$CHANGED"; then js=true; fi
+          if grep -q '\.py$' <<<"$CHANGED"; then py=true; fi
+
+          echo "js=$js" >> "$GITHUB_OUTPUT"
+          echo "py=$py" >> "$GITHUB_OUTPUT"
+          echo "JS 变更: $js / PY 变更: $py"
+
+      # ── 2. Python 解密（仅当本次改动了 .py）────────────────────────────
+      # decode.py 只用标准库（zlib/bz2/lzma...），没有 pip 依赖需要缓存
+      - name: Decode Python (input.py -> output.py)
+        if: steps.changed.outputs.py == 'true'
+        run: python src/decode.py
+
+      # ── 3. JS 解密（仅当本次改动了 .js）+ 依赖缓存 ─────────────────────
+      - name: Setup Node.js
+        if: steps.changed.outputs.js == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'              # Node 20 LTS，避免 isolated-vm 编译错误
+          cache: npm                      # 缓存 ~/.npm，命中后不用重新下载依赖包
+          cache-dependency-path: package.json
+
+      - name: Cache node_modules
+        id: node-modules-cache
+        if: steps.changed.outputs.js == 'true'
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node20-nm-${{ hashFiles('package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node20-nm-
+
+      - name: Install dependencies
+        # package.json 没变（缓存精确命中）时完全跳过安装
+        if: steps.changed.outputs.js == 'true' && steps.node-modules-cache.outputs.cache-hit != 'true'
+        run: npm install --no-package-lock --no-audit --no-fund
+
+      - name: Decode JavaScript (input.js -> output.js)
+        if: steps.changed.outputs.js == 'true'
+        run: npm run decode -- -i input.js -o output.js
+
+      # ── 4. 提交结果，并把整个历史压缩成单个 commit 后 force push ────────
+      - name: Configure Git author
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "action"
+
+      - name: Commit outputs and reset history
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          # 用当前工作区（含刚生成的 output.js / output.py）创建全新的根提交，
+          # 旧的 commit 记录整体丢弃：节省空间，同时抹掉输入文件的历史版本
+          git checkout --orphan history-reset
+          git add -A
+          git commit -m "chore: update decoded outputs $(date -u '+%Y-%m-%d %H:%M UTC') [skip ci]"
+          git branch -D "$BRANCH" 2>/dev/null || true
+          git branch -m "$BRANCH"
+          git push --force origin "$BRANCH"
